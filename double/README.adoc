@@ -1,0 +1,283 @@
+[[_multiple_ui_applications_and_a_gateway_single_page_application_with_spring_and_angular_js_part_vi]]
+= Multiple UI Applications and a Gateway
+
+In this section we continue <<_sso_with_oauth2_angular_js_and_spring_security_part_v,our discussion>> of how to use https://projects.spring.io/spring-security[Spring Security] with https://angular.io[Angular] in a "single page application". Here we show how to use https://spring.io/projects/spring-session[Spring Session] together with https://spring.io/projects/spring-cloud-gateway[Spring Cloud Gateway] to combine the features of the systems we built in parts II and IV, and actually end up building three single page applications with quite different responsibilities. The aim is to build a Gateway (like in <<_the_api_gateway_pattern_angular_js_and_spring_security_part_iv,part IV>>) that is used not only for API resources but also to load the UI from a backend server. We simplify the token-wrangling bits of <<_the_login_page_angular_js_and_spring_security_part_ii,part II>> by using the Gateway to pass through the authentication to the backends. Then we extend the system to show how we can make local, granular access decisions in the backends, while still controlling identity and authentication at the Gateway. This is a very powerful model for building distributed systems in general, and has a number of benefits that we can explore as we introduce the features in the code we build.
+
+____
+Reminder: if you are working through this section with the sample application, be sure to clear your browser cache of cookies and HTTP Basic credentials. In Chrome the best way to do that is to open a new incognito window.
+____
+
+== Target Architecture
+
+Here's a picture of the basic system we are going to build to start with:
+
+image:https://raw.githubusercontent.com/spring-guides/tut-spring-security-and-angular-js/master/double/double-simple.png[Components of the System]
+
+Like the other sample applications in this series it has a UI (HTML and JavaScript) and a Resource server. Like the sample in <<_the_api_gateway_pattern_angular_js_and_spring_security_part_iv,Section IV>> it has a Gateway, but here it is separate, not part of the UI. The UI effectively becomes part of the backend, giving us even more choice to re-configure and re-implement features, and also bringing other benefits as we will see.
+
+The browser goes to the Gateway for everything and it doesn't have to know about the architecture of the backend (fundamentally, it has no idea that there is a back end). One of the things the browser does in this Gateway is authentication, e.g. it sends a username and password like in <<_the_login_page_angular_js_and_spring_security_part_ii,Section II>>, and it gets a cookie in return. On subsequent requests it presents the cookie automatically and the Gateway passes it through to the backends. No code needs to be written on the client to enable the cookie passing. The backends use the cookie to authenticate and because all components share a session they share the same information about the user. Contrast this with <<_sso_with_oauth2_angular_js_and_spring_security_part_v,Section V>> where the cookie had to be converted to an access token in the Gateway, and the access token then had to be independently decoded by all the backend components.
+
+As in <<_the_api_gateway_pattern_angular_js_and_spring_security_part_iv,Section IV>> the Gateway simplifies the interaction between clients and servers, and it presents a small, well-defined surface on which to deal with security. For example, we don't need to worry about https://en.wikipedia.org/wiki/Cross-origin_resource_sharing[Cross Origin Resource Sharing], which is a welcome relief since it is easy to get wrong.
+
+The source code for the complete project we are going to build is in https://github.com/spring-guides/tut-spring-security-and-angular-js/tree/master/double[Github here], so you can just clone the project and work directly from there if you want. There is an extra component in the end state of this system ("double-admin") so ignore that for now.
+
+== How Shared Session Authentication Works
+
+Before diving into the code, let's understand the key architectural concept: **shared session authentication**.
+
+1. The **Gateway** authenticates users (via HTTP Basic in this example) and stores the authenticated `SecurityContext` in a Redis-backed session.
+2. A **SESSION cookie** is sent to the browser containing the session ID.
+3. When the browser makes requests through the Gateway to backend services, the SESSION cookie is forwarded.
+4. **Backend services** use Spring Session with the same Redis instance to look up the shared session and find the already-authenticated user.
+5. No credentials are forwarded to backends - they simply read the `SecurityContext` from the shared session.
+
+This approach requires some specific configuration in Spring Security 6, which we'll cover below.
+
+== Prerequisites
+
+You'll need Redis running locally for session storage:
+
+[source,bash]
+----
+docker run -p 6379:6379 redis
+----
+
+== The Gateway
+
+The Gateway is a Spring Boot application with Spring Cloud Gateway MVC that proxies requests to backend services and handles authentication.
+
+=== Dependencies
+
+The Gateway needs these key dependencies:
+
+- `spring-boot-starter-web` - for servlet-based web application
+- `spring-cloud-starter-gateway-server-webmvc` - for routing/proxying
+- `spring-boot-starter-security` - for authentication
+- `spring-session-data-redis` - for shared sessions
+
+=== Route Configuration
+
+Routes are configured in `application.yml` using Spring Cloud Gateway MVC properties:
+
+.gateway/src/main/resources/application.yml
+[source,yaml]
+----
+spring:
+  session:
+    store-type: redis
+  cloud:
+    gateway:
+      mvc:
+        routes:
+          - id: ui
+            uri: http://localhost:8081
+            predicates:
+              - Path=/ui/**
+            filters:
+              - StripPrefix=1
+          - id: admin
+            uri: http://localhost:8082
+            predicates:
+              - Path=/admin/**
+            filters:
+              - StripPrefix=1
+          - id: resource
+            uri: http://localhost:9000
+            predicates:
+              - Path=/resource/**
+            filters:
+              - StripPrefix=1
+----
+
+There are three routes in the proxy: one each for the UI, Admin, and Resource server. The `StripPrefix=1` filter removes the first path segment (e.g., `/ui/user` becomes `/user` when forwarded to the UI backend).
+
+=== Security Configuration
+
+The Gateway's security configuration handles authentication and CSRF for the Angular SPA:
+
+.gateway/src/main/java/demo/GatewayApplication.java (Security Configuration)
+[source,java]
+----
+include::gateway/src/main/java/demo/GatewayApplication.java[lines=53..88,indent=0]
+----
+
+Key points:
+
+1. **`HttpSessionSecurityContextRepository`**: In Spring Security 6, the `SecurityContext` is no longer automatically saved to the session. We explicitly configure this to ensure the authenticated user is stored in the Redis-backed session.
+
+2. **`CsrfTokenRequestAttributeHandler`**: Disables BREACH protection for CSRF tokens, allowing the Angular app to read the token directly from the cookie.
+
+3. **`CsrfCookieFilter`**: In Spring Security 6, CSRF tokens are lazily loaded. This filter eagerly loads the token so it's written to the cookie on every response.
+
+The `CsrfCookieFilter` is a simple filter that forces the CSRF token to be loaded:
+
+.gateway/src/main/java/demo/GatewayApplication.java (CSRF Filter)
+[source,java]
+----
+include::gateway/src/main/java/demo/GatewayApplication.java[lines=91..107,indent=0]
+----
+
+=== User Accounts
+
+For this sample, user accounts are defined in-memory in the Gateway:
+
+.gateway/src/main/java/demo/GatewayApplication.java (User Details)
+[source,java]
+----
+include::gateway/src/main/java/demo/GatewayApplication.java[lines=62..68,indent=0]
+----
+
+TIP: In a production system the user account data would be managed in a backend database (most likely a directory service), not hard coded in the Spring configuration.
+
+=== The /user Endpoint
+
+The Gateway exposes a `/user` endpoint that returns the authenticated user's name and roles:
+
+.gateway/src/main/java/demo/GatewayApplication.java
+[source,java]
+----
+include::gateway/src/main/java/demo/GatewayApplication.java[lines=40..47,indent=0]
+----
+
+== The UI Backend
+
+The UI backend is a simple Spring Boot application that serves an Angular SPA and provides a `/user` endpoint.
+
+=== Security Configuration
+
+The UI backend does NOT authenticate users itself. Instead, it reads the authenticated user from the shared Redis session:
+
+.ui/src/main/java/demo/UiApplication.java
+[source,java]
+----
+include::ui/src/main/java/demo/UiApplication.java[lines=39..52,indent=0]
+----
+
+Key points:
+
+1. **No `httpBasic()`**: The UI doesn't authenticate - it relies on the Gateway.
+2. **`SessionCreationPolicy.NEVER`**: The UI never creates sessions; it only reads existing ones from Redis.
+
+=== Application Configuration
+
+.ui/src/main/resources/application.yml
+[source,yaml]
+----
+include::ui/src/main/resources/application.yml[indent=0]
+----
+
+The `spring.session.store-type: redis` is essential - it tells Spring Session to use the same Redis instance as the Gateway.
+
+=== Angular Application
+
+The UI's Angular application checks if the user is authenticated and fetches a greeting from the Resource server:
+
+.ui/src/app/app.component.ts
+[source,typescript]
+----
+include::ui/src/app/app.component.ts[indent=0]
+----
+
+== The Resource Server
+
+The Resource server provides API endpoints and also reads authentication from the shared session:
+
+.resource/src/main/java/demo/ResourceApplication.java (Security Configuration)
+[source,java]
+----
+include::resource/src/main/java/demo/ResourceApplication.java[lines=56..69,indent=0]
+----
+
+The Resource server uses `SessionCreationPolicy.NEVER` and relies on the shared session for authentication.
+
+== Up and Running
+
+We now have three components running on three ports:
+
+- Gateway: http://localhost:8080
+- UI: http://localhost:8081 (accessed via Gateway at /ui/)
+- Resource: http://localhost:9000 (accessed via Gateway at /resource/)
+
+Start Redis and all three applications, then point your browser at http://localhost:8080. You should see a login form. Authenticate as "user/password" and you'll see links to the UI interface.
+
+|===
+|Verb |Path |Status |Response
+
+|GET |/ |200 |Gateway home page with login form
+|POST |/login |302 |Authenticate and redirect
+|GET |/ui/ |200 |UI Angular app (proxied from port 8081)
+|GET |/ui/user |200 |Authenticated user info
+|GET |/resource/ |200 |JSON greeting (proxied from port 9000)
+|===
+
+== The Gateway Angular Application
+
+The Gateway has its own Angular application that provides a login form and navigation to the backend UIs:
+
+.gateway/src/app/app.component.ts
+[source,typescript]
+----
+include::gateway/src/app/app.component.ts[indent=0]
+----
+
+.gateway/src/app/app.component.html
+[source,html]
+----
+include::gateway/src/app/app.component.html[indent=0]
+----
+
+The `login()` function sends credentials via HTTP Basic authentication. On success, the Gateway creates a session and subsequent requests use the SESSION cookie.
+
+== Granular Access Decisions in the Backend
+
+Now let's add an Admin application that requires the "ADMIN" role.
+
+image:https://raw.githubusercontent.com/spring-guides/tut-spring-security-and-angular-js/master/double/double-components.png[Components of the System]
+
+=== Admin Security Configuration
+
+The Admin application requires the "ADMIN" role in the following way:
+
+.admin/src/main/java/demo/AdminApplication.java
+[source,java]
+----
+include::admin/src/main/java/demo/AdminApplication.java[lines=42..55,indent=0]
+----
+
+=== The /user Endpoint with Roles
+
+The Admin application's `/user` endpoint returns roles so the Angular app can make client-side access decisions:
+
+.admin/src/main/java/demo/AdminApplication.java
+[source,java]
+----
+include::admin/src/main/java/demo/AdminApplication.java[lines=29..36,indent=0]
+----
+
+NOTE: Role names come back from the "/user" endpoint with the "ROLE_" prefix so we can distinguish them from other kinds of authorities (it's a Spring Security thing).
+
+== Why are we Here?
+
+Now we have a nice little system with two independent user interfaces and a backend Resource server, all protected by the same authentication in a Gateway. The fact that the Gateway acts as a micro-proxy makes the implementation of the backend security concerns extremely simple, and they are free to concentrate on their own business concerns. The use of Spring Session has (again) avoided a huge amount of hassle and potential errors.
+
+A powerful feature is that the backends can independently have any kind of authentication they like (e.g. you can go directly to the UI if you know its physical address and a set of local credentials). The Gateway imposes a completely unrelated set of constraints, as long as it can authenticate users and assign metadata to them that satisfy the access rules in the backends. This is an excellent design for being able to independently develop and test the backend components.
+
+A bonus feature of this architecture (single Gateway controlling authentication, and shared session token across all components) is that "Single Logout", a feature we identified as difficult to implement in <<_sso_with_oauth2_angular_js_and_spring_security_part_v,Section V>>, comes for free. To be more precise, one particular approach to the user experience of single logout is automatically available in our finished system: if a user logs out of any of the UIs (Gateway, UI backend or Admin backend), they are logged out of all the others, assuming that each individual UI implemented a "logout" feature the same way (invalidating the session).
+
+== Spring Security 6 Migration Notes
+
+If you're migrating from an older version of this tutorial, here are the key changes for Spring Security 6:
+
+1. **SecurityContext is not automatically saved**: You must explicitly configure `HttpSessionSecurityContextRepository` on authentication mechanisms.
+
+2. **CSRF tokens are lazily loaded**: SPAs need to trigger token loading via a filter like `CsrfCookieFilter`.
+
+3. **BREACH protection is enabled by default**: Use `CsrfTokenRequestAttributeHandler` instead of `XorCsrfTokenRequestAttributeHandler` if your SPA reads the CSRF cookie directly.
+
+4. **`WebSecurityConfigurerAdapter` is removed**: Use `SecurityFilterChain` beans instead.
+
+5. **`security.sessions` property is removed**: Use `SessionCreationPolicy` in the `SecurityFilterChain` configuration.
+
+****
+Thanks: I would like to thank again everyone who helped me develop this series, and in particular https://spring.io/team/rwinch[Rob Winch] and https://twitter.com/thspaeth[Thorsten Späth] for their careful reviews of the sections and sources code. Since <<_spring_and_angular_js_a_secure_single_page_application,Section I>> was published it hasn't changed much but all the other parts have evolved in response to comments and insights from readers, so thank you also to anyone who read the sections and took the trouble to join in the discussion.
+****

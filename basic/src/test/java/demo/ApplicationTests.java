@@ -1,0 +1,25 @@
+package demo;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+
+@SpringBootTest(webEnvironment=WebEnvironment.RANDOM_PORT)
+public class ApplicationTests {
+
+	@LocalServerPort
+	private int port;
+
+	@Test
+	public void homePageProtected() {
+		ResponseEntity<String> response = new TestRestTemplate().getForEntity("http://localhost:" + port + "/", String.class);
+		assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+	}
+
+}

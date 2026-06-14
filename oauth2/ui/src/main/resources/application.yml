@@ -1,0 +1,43 @@
+spring:
+  aop:
+    proxy-target-class: true
+  web:
+    resources:
+      static-locations: classpath:/static/browser/
+  security:
+    oauth2:
+      client:
+        registration:
+          acme:
+            client-id: acme
+            client-secret: acmesecret
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            scope: openid
+        provider:
+          acme:
+            authorization-uri: http://localhost:9999/oauth2/authorize
+            token-uri: http://localhost:9999/oauth2/token
+            jwk-set-uri: http://localhost:9999/oauth2/jwks
+            user-info-uri: http://localhost:9999/userinfo
+  cloud:
+    gateway:
+      mvc:
+        routes:
+          - id: resource
+            uri: http://localhost:9000
+            predicates:
+              - Path=/resource/**
+            filters:
+              - StripPrefix=1
+              - TokenRelay
+          - id: user
+            uri: http://localhost:9999
+            predicates:
+              - Path=/user/**
+            filters:
+              - TokenRelay
+
+logging:
+  level:
+    org.springframework.security: TRACE
