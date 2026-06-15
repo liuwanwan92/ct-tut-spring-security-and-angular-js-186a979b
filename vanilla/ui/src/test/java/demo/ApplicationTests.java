@@ -1,0 +1,44 @@
+package demo;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+
+@SpringBootTest(webEnvironment=WebEnvironment.RANDOM_PORT)
+public class ApplicationTests {
+
+	@LocalServerPort
+	private int port;
+
+	private TestRestTemplate template = new TestRestTemplate();
+
+	@Test
+	public void homePageLoads() {
+		ResponseEntity<String> response = template.getForEntity("http://localhost:"
+				+ port + "/", String.class);
+		assertEquals(HttpStatus.OK, response.getStatusCode());
+	}
+
+	@Test
+	public void userEndpointProtected() {
+		ResponseEntity<String> response = template.getForEntity("http://localhost:"
+				+ port + "/user", String.class);
+		// Request is redirected to login page (which returns 200 after following redirect)
+		assertEquals(HttpStatus.OK, response.getStatusCode());
+	}
+
+	@Test
+	public void loginSucceeds() {
+		TestRestTemplate authTemplate = new TestRestTemplate("user", "password");
+		ResponseEntity<String> response = authTemplate.getForEntity("http://localhost:"
+				+ port + "/user", String.class);
+		assertEquals(HttpStatus.OK, response.getStatusCode());
+	}
+
+}

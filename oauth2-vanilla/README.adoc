@@ -1,0 +1,294 @@
+[[_sso_with_oauth2_angular_js_and_spring_security_part_v]]
+= Single Sign On with OAuth2
+
+In this section we continue <<_the_api_gateway_pattern_angular_js_and_spring_security_part_iv,our discussion>> of how to use https://projects.spring.io/spring-security[Spring Security] with https://angular.io[Angular] in a "single page application". Here we show how to use https://spring.io/projects/spring-authorization-server[Spring Authorization Server] together with https://spring.io/projects/spring-cloud-gateway[Spring Cloud Gateway] to extend our API Gateway to do Single Sign On and OAuth2 token authentication to backend resources. This is the fifth in a series of sections, and you can catch up on the basic building blocks of the application or build it from scratch by reading the <<_spring_and_angular_js_a_secure_single_page_application,first section>>, or you can just go straight to the https://github.com/spring-guides/tut-spring-security-and-angular-js/tree/master/oauth2-vanilla[source code in Github]. In the <<_the_api_gateway_pattern_angular_js_and_spring_security_part_iv,last section>> we built a small distributed application that used https://github.com/spring-projects/spring-session/[Spring Session] to authenticate the backend resources and https://projects.spring.io/spring-cloud/[Spring Cloud] to implement an embedded API Gateway in the UI server. In this section we extract the authentication responsibilities to a separate server to make our UI server the first of potentially many Single Sign On applications to the authorization server. This is a common pattern in many applications these days, both in the enterprise and in social startups. We will use an OAuth2 server as the authenticator, so that we can also use it to grant tokens for the backend resource server. Spring Cloud Gateway will automatically relay the access token to our backend, and enable us to further simplify the implementation of both the UI and resource servers.
+
+____
+Reminder: if you are working through this section with the sample application, be sure to clear your browser cache of cookies and HTTP Basic credentials. In Chrome the best way to do that for a single server is to open a new incognito window.
+____
+
+== Creating an OAuth2 Authorization Server
+
+Our first step is to create a new server to handle authentication and token management. Following the steps in <<_spring_and_angular_js_a_secure_single_page_application,Part I>> we can begin with https://start.spring.io[Spring Boot Initializr]. E.g. using curl on a UN*X like system:
+
+[source]
+----
+$ curl https://start.spring.io/starter.tgz -d dependencies=web,security -d name=authserver | tar -xzvf -
+----
+
+You can then import that project (it's a normal Maven Java project by default) into your favourite IDE, or just work with the files and "mvn" on the command line.
+
+=== Adding the OAuth2 Dependencies
+
+We need to add the https://spring.io/projects/spring-authorization-server[Spring Authorization Server] dependency, so in our https://github.com/spring-guides/tut-spring-security-and-angular-js/blob/master/oauth2-vanilla/authserver/pom.xml[POM] we add:
+
+.pom.xml
+[source,xml]
+----
+<dependency>
+  <groupId>org.springframework.security</groupId>
+  <artifactId>spring-security-oauth2-authorization-server</artifactId>
+</dependency>
+----
+
+The authorization server requires some configuration. We need two security filter chains (one for OAuth2 endpoints, one for user authentication), a registered client, JWT signing keys, and user details:
+
+.AuthserverApplication.java
+[source,java]
+----
+include::authserver/src/main/java/demo/AuthserverApplication.java[indent=0]
+----
+
+The key components are:
+
+1. **Two `SecurityFilterChain` beans**: Order 1 applies OAuth2 authorization server defaults and enables OIDC; Order 2 handles form-based user authentication
+2. **`RegisteredClientRepository`**: Registers the "acme" client with its secret, grant types, redirect URI, and scopes
+3. **`JWKSource`**: Provides RSA keys for signing JWT tokens
+4. **`UserDetailsService`**: Defines in-memory users for authentication
+
+Now let's get it running on port 9999, with a predictable password for testing:
+
+.application.properties
+[source,properties]
+----
+include::authserver/src/main/resources/application.properties[indent=0]
+----
+
+IMPORTANT: We set `server.servlet.session.cookie.name=AUTHSESSIONID` so that the authorization server's session cookie doesn't collide with the UI application's `JSESSIONID` cookie, since both run on localhost.
+
+So, let's get the server running and we can make sure it is working:
+
+[source]
+----
+$ mvn spring-boot:run
+----
+
+or start the `main()` method in your IDE.
+
+=== Testing the Authorization Server
+
+Our server is using form-based login, so it will be protected and show a login page. To initiate an https://tools.ietf.org/html/rfc6749#section-1.3.1[authorization code token grant] you visit the authorization endpoint, e.g. at http://localhost:9999/oauth2/authorize?response_type=code&client_id=acme&scope=openid&redirect_uri=http://localhost:8080/login/oauth2/code/acme once you have authenticated you will get a redirect with an authorization code attached, e.g. `?code=jYWioI`.
+
+NOTE: for the purposes of this sample application we have created a client "acme" with a specific registered redirect URI. In a production application you should always register redirect URIs (and use HTTPS).
+
+The code can be exchanged for an access token using the "acme" client credentials on the token endpoint:
+
+[source]
+----
+$ curl acme:acmesecret@localhost:9999/oauth2/token  \
+-d grant_type=authorization_code -d client_id=acme     \
+-d redirect_uri=http://localhost:8080/login/oauth2/code/acme -d code=jYWioI
+{"access_token":"eyJra...","token_type":"Bearer","expires_in":299,...}
+----
+
+The access token is a JWT, backed by the RSA keys configured in the server. We also get a refresh token that we can use to get a new access token when the current one expires.
+
+[[changing-the-resource-server]]
+== Changing the Resource Server
+
+If we follow on from <<_the_api_gateway_pattern_angular_js_and_spring_security_part_iv,Part IV>>, our resource server is using https://github.com/spring-projects/spring-session/[Spring Session] for authentication, so we can take that out and replace it with Spring OAuth2 Resource Server. We also need to remove the Spring Session and Redis dependencies, so replace this:
+
+.pom.xml
+[source,xml]
+----
+<dependency>
+  <groupId>org.springframework.session</groupId>
+  <artifactId>spring-session</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-redis</artifactId>
+</dependency>
+----
+
+with this:
+
+.pom.xml
+[source,xml]
+----
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+----
+
+and then configure the security filter chain to use JWT validation:
+
+.ResourceApplication.java
+[source,java]
+----
+include::resource/src/main/java/demo/ResourceApplication.java[indent=0]
+----
+
+With that change the app is ready to challenge for an access token instead of HTTP Basic, but we need a config change to actually finish the process. We are going to add a small amount of external configuration (in "application.properties") to allow the resource server to validate the tokens it is given:
+
+.application.properties
+[source,properties]
+----
+include::resource/src/main/resources/application.properties[indent=0]
+----
+
+This tells the server to use the authorization server's JWK Set endpoint to obtain the public keys for validating JWT signatures.
+
+Run the application and hit the home page with a command line client:
+
+[source]
+----
+$ curl -v localhost:9000
+> GET / HTTP/1.1
+> User-Agent: curl/7.35.0
+> Host: localhost:9000
+> Accept: */*
+>
+< HTTP/1.1 401 Unauthorized
+...
+< WWW-Authenticate: Bearer
+...
+----
+
+and you will see a 401 with a "WWW-Authenticate" header indicating that it wants a bearer token.
+
+NOTE: JWT validation using a JWK Set URI is efficient because the resource server can validate tokens locally using the public key, without making a network call for each request. The keys are cached and refreshed periodically.
+
+== Implementing the User Endpoint
+
+On the authorization server we can easily add that endpoint:
+
+.AuthserverApplication.java
+[source,java]
+----
+@SpringBootApplication
+@RestController
+public class AuthserverApplication {
+
+  @RequestMapping("/user")
+  public Principal user(Principal user) {
+    return user;
+  }
+
+  ...
+
+}
+----
+
+We added a `@RequestMapping` the same as the UI server in <<_the_login_page_angular_js_and_spring_security_part_ii,Part II>>.
+
+With that endpoint in place we can test it and the greeting resource, since they both now accept bearer tokens that were created by the authorization server:
+
+[source]
+----
+$ TOKEN=eyJra...
+$ curl -H "Authorization: Bearer $TOKEN" localhost:9000
+{"id":"03af8be3-2fc3-4d75-acf7-c484d9cf32b1","content":"Hello World"}
+$ curl -H "Authorization: Bearer $TOKEN" localhost:9999/user
+{"details":...,"principal":{"username":"user",...},"name":"user"}
+----
+
+(substitute the value of the access token that you obtain from your own authorization server to get that working yourself).
+
+== The UI Server
+
+The final piece of this application we need to complete is the UI server, extracting the authentication part and delegating to the authorization server. So, as with link:#changing-the-resource-server[the resource server], we first need to remove the Spring Session and Redis dependencies and replace them with Spring OAuth2 Client. We also need Spring Cloud Gateway to proxy requests to the backend:
+
+.pom.xml
+[source,xml]
+----
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-oauth2-client</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-gateway-server-webmvc</artifactId>
+</dependency>
+----
+
+Once that is done we can configure the application to use OAuth2 login and set up the security filter chain:
+
+.UiApplication.java
+[source,java]
+----
+include::ui/src/main/java/demo/UiApplication.java[indent=0]
+----
+
+The main features are:
+
+1. **`oauth2Login()`**: Enables OAuth2/OIDC login - Spring Security handles the entire authorization code flow
+2. **Static resources permitted**: Angular's compiled assets (`.js`, `.css`) must be accessible without authentication
+3. **CSRF configuration**: Uses `CsrfTokenRequestAttributeHandler` to disable BREACH protection, and `CsrfCookieFilter` to eagerly load the CSRF token for the Angular app
+
+The explicit `logout()` configuration explicitly adds a success url that is unprotected, so that an XHR request to `/logout` will return successfully.
+
+There is also mandatory external configuration for the OAuth2 client to be able to contact and authenticate with the right authorization server. So we need this in `application.yml`:
+
+.application.yml
+[source,yaml]
+----
+include::ui/src/main/resources/application.yml[indent=0]
+----
+
+The bulk of that is about the OAuth2 client ("acme") and the authorization server locations. The gateway routes configuration proxies `/resource/**` to the resource server and `/user/**` to the authorization server, using the `TokenRelay` filter to forward the access token.
+
+=== In the Client
+
+There are some tweaks to the UI application on the front end that we still need to make to trigger the redirect to the authorization server. In this simple demo we can strip the Angular app down to its bare essentials so you can see what is going on more clearly. So we forgo, for now, the use of forms or routes, and we go back to a single Angular component:
+
+.app.component.ts
+[source,javascript]
+----
+include::ui/src/app/app.component.ts[indent=0]
+----
+
+The `AppComponent` handles everything, fetching the user details and, if successful, the greeting. It also provides the `logout` function.
+
+Now we need to create the template for this new component:
+
+.app.component.html
+[source,html]
+----
+include::ui/src/app/app.component.html[indent=0]
+----
+
+and include it in the home page as `<app-root/>`.
+
+Note that the navigation link for "Login" is a regular link with an `href` (not an Angular route). The "/login" endpoint that this goes to is handled by Spring Security and if the user is not authenticated it will result in a redirect to the authorization server.
+
+== How Does it Work?
+
+Run all the servers together now, and visit the UI in a browser at http://localhost:8080[http://localhost:8080]. Click on the "login" link and you will be redirected to the authorization server to authenticate (form login) and approve the token grant, before being redirected to the home page in the UI with the greeting fetched from the OAuth2 resource server using the same token as we authenticated the UI with.
+
+The interactions between the browser and the backend can be seen in your browser if you use some developer tools (usually F12 opens this up, works in Chrome by default, may require a plugin in Firefox). Here's a summary:
+
+|===
+|Verb |Path |Status |Response
+
+|GET |/ |200 |index.html
+|GET |/*.js |200 |Assets from angular
+|GET |/user |302 |Redirect to login page
+|GET |/login |302 |Redirect to auth server
+|GET |(authserver)/oauth2/authorize |302 |Redirect to login form
+|GET |(authserver)/login |200 |Login form
+|POST |(authserver)/login |302 |Redirect to authorize
+|GET |(authserver)/oauth2/authorize |302 |User approves grant, redirect to /login/oauth2/code/acme
+|GET |/login/oauth2/code/acme |302 |Exchange code for token, redirect to home page
+|GET |/user |200 |(Proxied) JSON authenticated user
+|GET |/resource |200 |(Proxied) JSON greeting
+|===
+
+The requests prefixed with (authserver) are to the authorization server. The `TokenRelay` filter in Spring Cloud Gateway takes care of forwarding the access token to the proxied backends.
+
+NOTE: Try to use a different browser for testing so that there is no chance of authentication crossover (e.g. use Firefox if you used Chrome for testing the UI).
+
+== The Logout Experience
+
+If you click on the "logout" link you will see that the home page changes (the greeting is no longer displayed) so the user is no longer authenticated with the UI server. Click back on "login" though and you actually _don't_ need to go back through the authentication and approval cycle in the authorization server (because you haven't logged out of that). Opinions will be divided as to whether that is a desirable user experience, and it's a notoriously tricky problem (Single Sign Out: https://www.sciencedirect.com/science/article/pii/S2214212614000179[Science Direct article] and https://wiki.shibboleth.net/confluence/display/SHIB2/SLOIssues[Shibboleth docs]). The ideal user experience might not be technically feasible, and you also have to be suspicious sometimes that users really want what they say they want. "I want 'logout' to log me out" sounds simple enough, but the obvious response is, "Logged out of what? Do you want to be logged out of _all_ the systems controlled by this SSO server, or just the one that you clicked the 'logout' link in?" If you are interested then there is <<_oauth2_logout_angular_js_and_spring_security_part_ix,a later section>> of this tutorial where it is discussed in more depth.
+
+== Conclusion
+
+This is almost the end of our shallow tour through the Spring Security and Angular stack. We have a nice architecture now with clear responsibilities in three separate components, UI/API Gateway, resource server and authorization server/token granter. The amount of non-business code in all layers is now minimal, and it's easy to see where to extend and improve the implementation with more business logic. The next steps will be to tidy up the UI in our authorization server, and probably add some more tests, including tests on the JavaScript client. Another interesting task is to extract all the boiler plate code and put it in a library (e.g. "spring-security-angular") containing Spring Security and Spring Session autoconfiguration and some webjars resources for the navigation controller in the Angular piece. Having read the sections in this series, anyone who was hoping to learn the inner workings of either Angular or Spring Security will probably be disappointed, but if you wanted to see how they can work well together and how a little bit of configuration can go a long way, then hopefully you will have had a good experience.
+
+The <<_multiple_ui_applications_and_a_gateway_single_page_application_with_spring_and_angular_js_part_vi,next section>> in the series is about access decisions (beyond authentication) and employs multiple UI applications behind the same proxy.
+
+== Addendum: Bootstrap UI and JWT Tokens for the Authorization Server
+
+You will find another version of this application in the https://github.com/spring-guides/tut-spring-security-and-angular-js/tree/master/oauth2[source code in Github] which has a pretty login page and user approval page implemented similarly to the way we did the login page in <<_the_login_page_angular_js_and_spring_security_part_ii,Part II>>. It also uses https://jwt.io/[JWT] to encode the tokens, so instead of using the "/user" endpoint, the resource server can pull enough information out of the token itself to do a simple authentication. The browser client still uses it, proxied through the UI server, so that it can determine if a user is authenticated (it doesn't need to do that very often, compared to the likely number of calls to a resource server in a real application).
